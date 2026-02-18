@@ -83,23 +83,6 @@ Mouse behavior:
 - Some web pages may behave poorly as a wallpaper (heavy GPU, autoplay policies, focus issues).
 - WebView2 DevTools input dispatch is used for wheel; if DevTools are disabled at runtime in future changes, wheel forwarding would need an alternative.
 
-## Troubleshooting
-
-- Wallpaper stays black:
-  - Confirm the URL is reachable in a normal browser.
-  - If using `http://127.0.0.1:5500`, make sure your local server is running.
-
-- WebView2 not initializing:
-  - Install/repair the WebView2 Runtime.
-  - The code retries initialization (handles `0x8007139F` resource-not-ready) a few times.
-
-- Mouse wheel doesn’t scroll:
-  - Some pages require the cursor to be over a scrollable element.
-  - If the page captures wheel events in JS, verify it’s handling them.
-
-- Desktop right-click menu closes / acts weird:
-  - The code attempts to cancel menus and close `#32768` popup menus when refocusing the wallpaper.
-  - If you want “desktop always wins” behavior, adjust the focus / swallow logic in `MouseHookCallback`.
 
 ## License
 MIT
