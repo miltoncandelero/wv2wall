@@ -1,0 +1,1012 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Microsoft.Web.WebView2.WinForms;
+
+internal static class Program
+{
+    [STAThread]
+    private static void Main()
+    {
+        ApplicationConfiguration.Initialize();
+        Application.Run(new WallpaperContext("http://127.0.0.1:5500"));
+    }
+}
+
+internal sealed class WallpaperContext : ApplicationContext
+{
+    private string _url;
+    private readonly NotifyIcon _tray;
+    private readonly ContextMenuStrip _menu;
+    private readonly List<ToolStripMenuItem> _monitorItems = new();
+    private readonly List<DeskForm> _forms = new();
+    private ToolStripMenuItem? _spanItem;
+    private ToolStripMenuItem? _allItem;
+    private WallpaperMode _mode = WallpaperMode.Span;
+    private WallpaperMode _pendingMode = WallpaperMode.Span;
+    private int _selectedMonitor;
+    private int _pendingMonitor;
+    private bool _switching;
+    private bool _exiting;
+
+    private IntPtr _mouseHook;
+    private IntPtr _keyboardHook;
+    private LowLevelMouseProc? _mouseProc;
+    private LowLevelKeyboardProc? _keyboardProc;
+    private bool _isWallpaperFocused = true;
+    private bool _isInteractingWithDesktop = false;
+
+    // Hook constants
+    private const int WH_KEYBOARD_LL = 13;
+    private const int WH_MOUSE_LL = 14;
+    private const int WM_MOUSEMOVE = 0x0200;
+    private const int WM_LBUTTONDOWN = 0x0201;
+    private const int WM_LBUTTONUP = 0x0202;
+    private const int WM_LBUTTONDBLCLK = 0x0203;
+    private const int WM_RBUTTONDOWN = 0x0204;
+    private const int WM_RBUTTONUP = 0x0205;
+    private const int WM_MBUTTONDOWN = 0x0207;
+    private const int WM_MBUTTONUP = 0x0208;
+    private const int WM_MOUSEWHEEL = 0x020A;
+    private const int WM_MOUSEHWHEEL = 0x020E;
+
+    private const int WM_KEYDOWN = 0x0100;
+    private const int WM_KEYUP = 0x0101;
+    private const int WM_SYSKEYDOWN = 0x0104;
+    private const int WM_SYSKEYUP = 0x0105;
+    private const int WM_CANCELMODE = 0x001F;
+    private const int WM_CLOSE = 0x0010;
+
+    public WallpaperContext(string url)
+    {
+        _url = url;
+        _menu = new ContextMenuStrip();
+        _tray = new NotifyIcon
+        {
+            Icon = SystemIcons.Application,
+            Text = "wv2wall",
+            Visible = true
+        };
+
+        BuildMenu();
+        InstallHooks();
+        ApplyMode();
+    }
+
+    private void InstallHooks()
+    {
+        _mouseProc = MouseHookCallback;
+        _keyboardProc = KeyboardHookCallback;
+
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        using var module = process.MainModule!;
+        IntPtr hMod = GetModuleHandle(module.ModuleName);
+
+        _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseProc, hMod, 0);
+        _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardProc, hMod, 0);
+    }
+
+    private void UninstallHooks()
+    {
+        if (_mouseHook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_mouseHook);
+            _mouseHook = IntPtr.Zero;
+        }
+        if (_keyboardHook != IntPtr.Zero)
+        {
+            UnhookWindowsHookEx(_keyboardHook);
+            _keyboardHook = IntPtr.Zero;
+        }
+    }
+
+    private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && _isWallpaperFocused)
+        {
+            int msg = (int)wParam;
+            if (msg == WM_KEYDOWN || msg == WM_KEYUP || msg == WM_SYSKEYDOWN || msg == WM_SYSKEYUP)
+            {
+                var info = Marshal.PtrToStructure<KBDLLHOOKSTRUCT>(lParam);
+                int vk = (int)info.vkCode;
+
+                // 1. ALWAYS PASS-THROUGH CRITICAL SYSTEM KEYS
+                // VK_LWIN(0x5B), VK_RWIN(0x5C), VK_SNAPSHOT(0x2C)
+                if (vk == 0x5B || vk == 0x5C || vk == 0x2C)
+                {
+                    if (_forms.Count > 0) _forms[0].PostKey(msg, vk, (int)info.scanCode, (int)info.flags);
+                    return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                }
+
+                // 2. HANDLE ALT+TAB
+                // VK_TAB = 0x09
+                if (vk == 0x09)
+                {
+                    bool altDown = (GetKeyState(0x12) & 0x8000) != 0; // VK_MENU
+                    if (altDown)
+                    {
+                        return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                    }
+                }
+
+                // 3. HANDLE MODIFIERS (Shift, Ctrl, Alt, CapsLock)
+                // Pass to OS AND WebView
+                // VK_SHIFT(0x10), VK_CONTROL(0x11), VK_MENU(0x12), VK_CAPITAL(0x14)
+                if (vk == 0x10 || vk == 0x11 || vk == 0x12 || vk == 0x14 ||
+                    vk == 0xA0 || vk == 0xA1 || vk == 0xA2 || vk == 0xA3 || vk == 0xA4 || vk == 0xA5)
+                {
+                    if (_forms.Count > 0) _forms[0].PostKey(msg, vk, (int)info.scanCode, (int)info.flags);
+                    return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                }
+
+                // 4. CONTENT KEYS
+                if (_forms.Count > 0)
+                {
+                    _forms[0].PostKey(msg, vk, (int)info.scanCode, (int)info.flags);
+                    return (IntPtr)1; // Swallow
+                }
+            }
+        }
+        return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern short GetKeyState(int nVirtKey);
+
+    private const int LVM_SETITEMSTATE = 0x1000 + 43;
+    private const int LVIS_SELECTED = 0x0002;
+    private const int LVIS_FOCUSED = 0x0001;
+    private const int LVIF_STATE = 0x0008;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LVITEM
+    {
+        public uint mask;
+        public int iItem;
+        public int iSubItem;
+        public uint state;
+        public uint stateMask;
+        public IntPtr pszText;
+        public int cchTextMax;
+        public int iImage;
+        public IntPtr lParam;
+        public int iIndent;
+        public int iGroupId;
+        public uint cColumns;
+        public IntPtr puColumns;
+        public IntPtr piColFmt;
+        public int iGroup;
+    }
+
+    private void DeselectDesktopIcons(IntPtr hWndDesktop)
+    {
+        uint pid;
+        GetWindowThreadProcessId(hWndDesktop, out pid);
+        IntPtr hProcess = OpenProcess(ProcessAccessFlags.VirtualMemoryOperation | ProcessAccessFlags.VirtualMemoryRead | ProcessAccessFlags.VirtualMemoryWrite, false, (int)pid);
+        if (hProcess == IntPtr.Zero) return;
+
+        IntPtr memPtr = IntPtr.Zero;
+        try
+        {
+            int size = Marshal.SizeOf<LVITEM>();
+            memPtr = VirtualAllocEx(hProcess, IntPtr.Zero, (uint)size, AllocationType.Commit, MemoryProtection.ReadWrite);
+            if (memPtr == IntPtr.Zero) return;
+
+            LVITEM item = new LVITEM();
+            item.mask = LVIF_STATE;
+            item.state = 0; // clear flags
+            item.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+
+            byte[] buffer = new byte[size];
+            IntPtr ptr = Marshal.AllocHGlobal(size);
+            Marshal.StructureToPtr(item, ptr, false);
+            Marshal.Copy(ptr, buffer, 0, size);
+            Marshal.FreeHGlobal(ptr);
+
+            int bytesWritten;
+            WriteProcessMemory(hProcess, memPtr, buffer, size, out bytesWritten);
+
+            SendMessage(hWndDesktop, LVM_SETITEMSTATE, (IntPtr)(-1), memPtr);
+        }
+        catch { }
+        finally
+        {
+            if (memPtr != IntPtr.Zero) VirtualFreeEx(hProcess, memPtr, 0, FreeType.Release);
+            CloseHandle(hProcess);
+        }
+    }
+
+    private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int msg = (int)wParam;
+            var info = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            var pt = new Point(info.pt.X, info.pt.Y);
+
+            if (_isInteractingWithDesktop)
+            {
+                if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP)
+                {
+                    _isInteractingWithDesktop = false;
+                }
+                return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+            }
+
+            IntPtr hWndUnderMouse = WindowFromPoint(info.pt);
+
+            if (IsDesktopWindow(hWndUnderMouse))
+            {
+                if (msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP)
+                {
+                    return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+                }
+
+                if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK)
+                {
+                    if (IsOverDesktopIcon(hWndUnderMouse, pt))
+                    {
+                        _isInteractingWithDesktop = true;
+                        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+                    }
+
+                    _isWallpaperFocused = true;
+                    DeselectDesktopIcons(hWndUnderMouse);
+
+                    PostMessage(GetShellWindow(), WM_CANCELMODE, IntPtr.Zero, IntPtr.Zero);
+                    IntPtr menuWnd = FindWindow("#32768", null);
+                    if (menuWnd != IntPtr.Zero && IsWindowVisible(menuWnd))
+                    {
+                        PostMessage(menuWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                        PostMessage(menuWnd, WM_KEYDOWN, (IntPtr)0x1B, IntPtr.Zero);
+                    }
+                }
+
+                if (msg == WM_LBUTTONDOWN || msg == WM_MBUTTONDOWN)
+                {
+                    _isWallpaperFocused = true;
+                }
+
+                DeskForm? targetForm = null;
+                foreach (var form in _forms)
+                {
+                    if (form.Bounds.Contains(pt))
+                    {
+                        targetForm = form;
+                        break;
+                    }
+                }
+
+                if (targetForm != null)
+                {
+                    IntPtr wvHwnd = targetForm.GetWebViewHandle();
+                    if (wvHwnd != IntPtr.Zero)
+                    {
+                        var clientPt = new POINT { X = pt.X, Y = pt.Y };
+                        ScreenToClient(wvHwnd, ref clientPt);
+
+                        if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+                        {
+                            short delta = (short)(info.mouseData >> 16);
+                            targetForm.DispatchScroll(clientPt.X, clientPt.Y, delta);
+                        }
+                        else
+                        {
+                            IntPtr newLParam = (IntPtr)((clientPt.Y << 16) | (clientPt.X & 0xFFFF));
+                            IntPtr newWParam = (IntPtr)GetModifierKeys();
+                            PostMessage(wvHwnd, msg, newWParam, newLParam);
+                        }
+
+                        if (msg != WM_MOUSEMOVE)
+                        {
+                            return (IntPtr)1;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN)
+                {
+                    _isWallpaperFocused = false;
+                }
+            }
+        }
+        return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+    }
+
+    private int GetModifierKeys()
+    {
+        int keys = 0;
+        if ((GetAsyncKeyState(0x01) & 0x8000) != 0) keys |= 0x0001;
+        if ((GetAsyncKeyState(0x02) & 0x8000) != 0) keys |= 0x0002;
+        if ((GetAsyncKeyState(0x10) & 0x8000) != 0) keys |= 0x0004;
+        if ((GetAsyncKeyState(0x11) & 0x8000) != 0) keys |= 0x0008;
+        if ((GetAsyncKeyState(0x04) & 0x8000) != 0) keys |= 0x0010;
+        return keys;
+    }
+
+    private bool IsDesktopWindow(IntPtr hwnd)
+    {
+        foreach (var form in _forms) if (form.Handle == hwnd) return true;
+
+        IntPtr root = GetAncestor(hwnd, GetAncestorFlags.GetRoot);
+        if (root == IntPtr.Zero) root = hwnd;
+
+        var sb = new StringBuilder(256);
+        GetClassName(root, sb, 256);
+        string cls = sb.ToString();
+
+        return cls == "Progman" || cls == "WorkerW";
+    }
+
+    private bool IsOverDesktopIcon(IntPtr hWnd, Point pt)
+    {
+        var sb = new StringBuilder(256);
+        GetClassName(hWnd, sb, 256);
+        if (sb.ToString() != "SysListView32") return false;
+
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+
+        IntPtr hProcess = OpenProcess(ProcessAccessFlags.VirtualMemoryOperation | ProcessAccessFlags.VirtualMemoryRead | ProcessAccessFlags.VirtualMemoryWrite, false, (int)pid);
+        if (hProcess == IntPtr.Zero) return false;
+
+        IntPtr memPtr = IntPtr.Zero;
+        try
+        {
+            POINT clientPt = new POINT { X = pt.X, Y = pt.Y };
+            ScreenToClient(hWnd, ref clientPt);
+
+            int size = Marshal.SizeOf<LVHITTESTINFO>();
+            memPtr = VirtualAllocEx(hProcess, IntPtr.Zero, (uint)size, AllocationType.Commit, MemoryProtection.ReadWrite);
+            if (memPtr == IntPtr.Zero) return false;
+
+            LVHITTESTINFO info = new LVHITTESTINFO();
+            info.pt = clientPt;
+
+            byte[] buffer = new byte[size];
+            IntPtr ptr = Marshal.AllocHGlobal(size);
+            Marshal.StructureToPtr(info, ptr, false);
+            Marshal.Copy(ptr, buffer, 0, size);
+            Marshal.FreeHGlobal(ptr);
+
+            int bytesWritten;
+            WriteProcessMemory(hProcess, memPtr, buffer, size, out bytesWritten);
+
+            SendMessage(hWnd, 0x1000 + 18, IntPtr.Zero, memPtr);
+
+            int bytesRead;
+            ReadProcessMemory(hProcess, memPtr, buffer, size, out bytesRead);
+
+            ptr = Marshal.AllocHGlobal(size);
+            Marshal.Copy(buffer, 0, ptr, size);
+            info = Marshal.PtrToStructure<LVHITTESTINFO>(ptr);
+            Marshal.FreeHGlobal(ptr);
+
+            if ((info.flags & 0x000E) != 0 || info.iItem != -1)
+            {
+                return true;
+            }
+        }
+        catch { }
+        finally
+        {
+            if (memPtr != IntPtr.Zero) VirtualFreeEx(hProcess, memPtr, 0, FreeType.Release);
+            CloseHandle(hProcess);
+        }
+
+        return false;
+    }
+
+    private void BuildMenu()
+    {
+        _menu.Items.Clear();
+        _monitorItems.Clear();
+
+        _menu.Items.Add(new ToolStripMenuItem("Set URL...", null, (_, _) => AskForUrl()));
+        _menu.Items.Add(new ToolStripSeparator());
+
+        _spanItem = new ToolStripMenuItem("Span (virtual screen)", null, (_, _) => SetMode(WallpaperMode.Span));
+        _allItem = new ToolStripMenuItem("All monitors", null, (_, _) => SetMode(WallpaperMode.All));
+        _menu.Items.Add(_spanItem);
+        _menu.Items.Add(_allItem);
+        _menu.Items.Add(new ToolStripSeparator());
+
+        var screens = Screen.AllScreens;
+        for (int i = 0; i < screens.Length; i++)
+        {
+            int index = i;
+            var item = new ToolStripMenuItem($"Monitor {i + 1}", null, (_, _) => SetSingle(index));
+            _monitorItems.Add(item);
+            _menu.Items.Add(item);
+        }
+
+        _menu.Items.Add(new ToolStripSeparator());
+        _menu.Items.Add(new ToolStripMenuItem("Exit", null, (_, _) => Exit()));
+
+        _tray.ContextMenuStrip = _menu;
+        UpdateChecks();
+    }
+
+    private void AskForUrl()
+    {
+        using var input = new InputBox("Enter URL", "Please enter the wallpaper URL:", _url);
+        if (input.ShowDialog() == DialogResult.OK)
+        {
+            _url = input.InputText;
+            ApplyMode();
+        }
+    }
+
+    private void SetMode(WallpaperMode mode)
+    {
+        if (_mode == mode) return;
+        _mode = mode;
+        ApplyMode();
+        UpdateChecks();
+    }
+
+    private void SetSingle(int index)
+    {
+        _selectedMonitor = index;
+        _mode = WallpaperMode.Single;
+        ApplyMode();
+        UpdateChecks();
+    }
+
+    private void ApplyMode()
+    {
+        var screens = Screen.AllScreens;
+        if (screens.Length == 0) return;
+
+        if (_selectedMonitor >= screens.Length) _selectedMonitor = 0;
+
+        if (_forms.Count > 0)
+        {
+            _switching = true;
+            _pendingMode = _mode;
+            _pendingMonitor = _selectedMonitor;
+
+            foreach (var form in _forms.ToArray())
+            {
+                form.Close();
+            }
+            return;
+        }
+
+        CreateFormsForMode(_mode, _selectedMonitor, screens);
+    }
+
+    private void CreateFormsForMode(WallpaperMode mode, int selectedMonitor, Screen[] screens)
+    {
+        _forms.Clear();
+        var virtualBounds = SystemInformation.VirtualScreen;
+
+        if (mode == WallpaperMode.Span)
+        {
+            _forms.Add(CreateForm(virtualBounds, virtualBounds));
+        }
+        else if (mode == WallpaperMode.All)
+        {
+            foreach (var screen in screens)
+            {
+                _forms.Add(CreateForm(screen.Bounds, virtualBounds));
+            }
+        }
+        else
+        {
+            _forms.Add(CreateForm(screens[selectedMonitor].Bounds, virtualBounds));
+        }
+    }
+
+    private DeskForm CreateForm(Rectangle targetBounds, Rectangle virtualBounds)
+    {
+        var form = new DeskForm(_url, targetBounds, virtualBounds);
+        form.FormClosed += OnFormClosed;
+        form.Show();
+        return form;
+    }
+
+    private void OnFormClosed(object? sender, FormClosedEventArgs e)
+    {
+        if (sender is DeskForm form)
+        {
+            _forms.Remove(form);
+            form.Dispose();
+            if (_exiting && _forms.Count == 0)
+            {
+                UninstallHooks();
+                _tray.Visible = false;
+                _tray.Dispose();
+                ExitThread();
+                return;
+            }
+
+            if (_switching && _forms.Count == 0)
+            {
+                _switching = false;
+                CreateFormsForMode(_pendingMode, _pendingMonitor, Screen.AllScreens);
+            }
+        }
+    }
+
+    private void UpdateChecks()
+    {
+        if (_spanItem != null) _spanItem.Checked = _mode == WallpaperMode.Span;
+        if (_allItem != null) _allItem.Checked = _mode == WallpaperMode.All;
+
+        for (int i = 0; i < _monitorItems.Count; i++)
+        {
+            _monitorItems[i].Checked = _mode == WallpaperMode.Single && i == _selectedMonitor;
+        }
+    }
+
+    private void Exit()
+    {
+        _exiting = true;
+        foreach (var form in _forms.ToArray())
+        {
+            form.Close();
+        }
+
+        if (_forms.Count == 0)
+        {
+            UninstallHooks();
+            _tray.Visible = false;
+            _tray.Dispose();
+            ExitThread();
+        }
+    }
+
+    private enum WallpaperMode { Span, All, Single }
+
+    private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KBDLLHOOKSTRUCT
+    {
+        public uint vkCode;
+        public uint scanCode;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT
+    {
+        public POINT pt;
+        public uint mouseData;
+        public uint flags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LVHITTESTINFO
+    {
+        public POINT pt;
+        public uint flags;
+        public int iItem;
+        public int iSubItem;
+        public int iGroup;
+    }
+
+    private enum GetAncestorFlags { GetParent = 1, GetRoot = 2, GetRootOwner = 3 }
+
+    [Flags]
+    private enum ProcessAccessFlags : uint
+    {
+        VirtualMemoryOperation = 0x0008,
+        VirtualMemoryRead = 0x0010,
+        VirtualMemoryWrite = 0x0020,
+    }
+
+    [Flags]
+    private enum AllocationType
+    {
+        Commit = 0x1000,
+        Release = 0x8000,
+    }
+
+    [Flags]
+    private enum MemoryProtection
+    {
+        ReadWrite = 0x04,
+    }
+
+    [Flags]
+    private enum FreeType
+    {
+        Release = 0x8000,
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT Point);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern IntPtr GetAncestor(IntPtr hwnd, GetAncestorFlags flags);
+
+    [DllImport("user32.dll")]
+    private static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetShellWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr OpenProcess(ProcessAccessFlags processAccess, bool bInheritHandle, int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+    private static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, AllocationType flAllocationType, MemoryProtection flProtect);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, int nSize, out int lpNumberOfBytesWritten);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, int nSize, out int lpNumberOfBytesRead);
+
+    [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+    private static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, int dwSize, FreeType dwFreeType);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+}
+
+public sealed class DeskForm : Form
+{
+    private const int WS_EX_TOOLWINDOW = 0x00000080;
+    private const uint SWP_NOACTIVATE = 0x0010;
+    private const uint SWP_SHOWWINDOW = 0x0040;
+    private static readonly IntPtr HWND_BOTTOM = new(1);
+    private readonly WebView2 _wv = new();
+    private readonly string _url;
+    private readonly Rectangle _targetBounds;
+    private readonly Rectangle _virtualBounds;
+    private readonly CancellationTokenSource _initCts = new();
+    private bool _initStarted;
+    private bool _closing;
+    private const int HR_RESOURCE_NOT_READY = unchecked((int)0x8007139F);
+
+    public DeskForm(string url, Rectangle targetBounds, Rectangle virtualBounds)
+    {
+        _url = url;
+        _targetBounds = targetBounds;
+        _virtualBounds = virtualBounds;
+
+        FormBorderStyle = FormBorderStyle.None;
+        ShowInTaskbar = false;
+        TopMost = false;
+        StartPosition = FormStartPosition.Manual;
+        Bounds = targetBounds;
+
+        _wv.Dock = DockStyle.Fill;
+        Controls.Add(_wv);
+
+        Shown += async (_, _) =>
+        {
+            if (_initStarted) return;
+            _initStarted = true;
+            AttachToWorkerW();
+
+            await InitializeWebViewAsync();
+        };
+
+        FormClosed += (_, _) =>
+        {
+            _closing = true;
+            _initCts.Cancel();
+            if (!_wv.IsDisposed) _wv.Dispose();
+        };
+    }
+
+    public void DispatchScroll(int x, int y, int delta)
+    {
+        if (_wv == null || _wv.IsDisposed || _wv.CoreWebView2 == null) return;
+        try
+        {
+            double scaledDelta = -delta * (100.0 / 120.0);
+            string val = scaledDelta.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            string json = $"{{\"type\":\"mouseWheel\",\"x\":{x},\"y\":{y},\"deltaX\":0,\"deltaY\":{val}}}";
+            _wv.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchMouseEvent", json);
+        }
+        catch { }
+    }
+
+    public void PostKey(int msg, int vkCode, int scanCode, int flags)
+    {
+        if (_wv == null || _wv.IsDisposed || _wv.CoreWebView2 == null) return;
+
+        IntPtr wvHwnd = GetWebViewHandle();
+        if (wvHwnd == IntPtr.Zero) return;
+
+        // Reconstruct lParam
+        int repeatCount = 1;
+        bool extended = (flags & 1) != 0;
+        bool altDown = (flags & 0x20) != 0;
+        bool up = (flags & 0x80) != 0;
+
+        long newLParam = repeatCount;
+        newLParam |= (long)scanCode << 16;
+        if (extended) newLParam |= 1L << 24;
+
+        // Handling Shortcuts (Alt+Key):
+        // If we receive WM_SYSKEYDOWN (Alt+Key), we want to convert it to WM_KEYDOWN
+        // so the browser sees it as a "Content" keystroke (e.g. shortcut) instead of "System" (Menu).
+        // HOWEVER, we must be careful:
+        // 1. If we send WM_KEYDOWN with bit 29 (Alt) SET, Chrome treats it as Alt+Key. Correct.
+        // 2. If we send WM_SYSKEYDOWN, Chrome treats it as Menu access. Incorrect for web apps.
+
+        int finalMsg = msg;
+
+        if (msg == 0x0104) // WM_SYSKEYDOWN
+        {
+            finalMsg = 0x0100; // WM_KEYDOWN
+            // We KEEP bit 29 set in lParam to indicate Alt is held.
+        }
+        else if (msg == 0x0105) // WM_SYSKEYUP
+        {
+            finalMsg = 0x0101; // WM_KEYUP
+        }
+
+        // Apply Alt bit (Bit 29)
+        if (altDown) newLParam |= 1L << 29;
+
+        // Apply Transition state (Bit 31 - KeyUp) and Previous State (Bit 30)
+        // Note: For KeyDown, Bit 31 is 0. For KeyUp, it is 1.
+        if (up) newLParam |= 1L << 31;
+        if (up || (msg == 0x0100 && (flags & 0x40) != 0)) // Check context code for repeat? No, just rely on KeyUp msg
+        {
+            // Actually, for WM_KEYUP/SYSKEYUP, bit 30 and 31 should be 1.
+            // But let's trust the logic: KeyUp msg implies bit 31=1.
+            // Previous state (bit 30) is 1 if key was down before.
+        }
+
+        // Simpler approach for 30/31:
+        if (msg == 0x0101 || msg == 0x0105) // UP
+        {
+            newLParam |= 1L << 30; // Previous state was down
+            newLParam |= 1L << 31; // Transition state is up
+        }
+        else // DOWN
+        {
+            // Bit 30: The previous key state. The value is 1 if the key is down before the message is sent, or it is zero if the key is up.
+            // For auto-repeat, this would be 1. We assume 0 for first press.
+            // We can just check the 'up' flag from the hook, which is 0 for down.
+        }
+
+        PostMessage(wvHwnd, finalMsg, (IntPtr)vkCode, (IntPtr)newLParam);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
+
+    public IntPtr GetWebViewHandle()
+    {
+        if (_wv == null || _wv.IsDisposed || _wv.CoreWebView2 == null)
+            return IntPtr.Zero;
+        return FindWindowRecursive(_wv.Handle, "Chrome_RenderWidgetHostHWND");
+    }
+
+    private IntPtr FindWindowRecursive(IntPtr parent, string className)
+    {
+        IntPtr found = FindWindowEx(parent, IntPtr.Zero, className, null);
+        if (found != IntPtr.Zero) return found;
+
+        IntPtr child = FindWindowEx(parent, IntPtr.Zero, null, null);
+        while (child != IntPtr.Zero)
+        {
+            found = FindWindowRecursive(child, className);
+            if (found != IntPtr.Zero) return found;
+            child = FindWindowEx(parent, child, null, null);
+        }
+        return IntPtr.Zero;
+    }
+
+    private async Task InitializeWebViewAsync()
+    {
+        int attempt = 0;
+        while (!_closing && !_initCts.IsCancellationRequested && attempt < 6)
+        {
+            try
+            {
+                await _wv.EnsureCoreWebView2Async();
+                if (_closing || _initCts.IsCancellationRequested || _wv.CoreWebView2 == null) return;
+
+                _wv.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+                _wv.CoreWebView2.Settings.AreDevToolsEnabled = false;
+                _wv.CoreWebView2.Navigate(_url);
+                return;
+            }
+            catch (COMException ex) when (ex.ErrorCode == HR_RESOURCE_NOT_READY)
+            {
+                attempt++;
+                try { await Task.Delay(200, _initCts.Token); } catch { return; }
+            }
+            catch (Exception) when (_closing || _initCts.IsCancellationRequested || IsDisposed)
+            {
+                return;
+            }
+        }
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= WS_EX_TOOLWINDOW;
+            return cp;
+        }
+    }
+
+    private void AttachToWorkerW()
+    {
+        var host = WorkerW.FindDesktopHost();
+        if (host != IntPtr.Zero)
+        {
+            SetParent(Handle, host);
+            ApplyBounds();
+        }
+    }
+
+    private void ApplyBounds()
+    {
+        int x = _targetBounds.Left - _virtualBounds.Left;
+        int y = _targetBounds.Top - _virtualBounds.Top;
+        SetWindowPos(Handle, HWND_BOTTOM, x, y, _targetBounds.Width, _targetBounds.Height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+
+    private static class WorkerW
+    {
+        private const int WM_SPAWN_WORKERW = 0x052C;
+        private const string ShellViewClass = "SHELLDLL_DefView";
+        private const string WorkerWClass = "WorkerW";
+
+        public static IntPtr FindDesktopHost()
+        {
+            IntPtr progman = FindWindow("Progman", null);
+            if (progman == IntPtr.Zero) return IntPtr.Zero;
+
+            SendMessageTimeout(progman, WM_SPAWN_WORKERW, IntPtr.Zero, IntPtr.Zero,
+                SendMessageTimeoutFlags.SMTO_NORMAL, 1000, out _);
+
+            IntPtr defViewInProgman = FindWindowEx(progman, IntPtr.Zero, ShellViewClass, null);
+            if (defViewInProgman != IntPtr.Zero)
+            {
+                IntPtr childWorker = FindWindowEx(progman, IntPtr.Zero, WorkerWClass, null);
+                if (childWorker != IntPtr.Zero) return childWorker;
+                return progman;
+            }
+
+            IntPtr workerw = IntPtr.Zero;
+
+            EnumWindows((top, _) =>
+            {
+                IntPtr defView = FindWindowEx(top, IntPtr.Zero, ShellViewClass, null);
+                if (defView != IntPtr.Zero)
+                {
+                    workerw = FindWindowEx(IntPtr.Zero, top, WorkerWClass, null);
+                    return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            return workerw != IntPtr.Zero ? workerw : progman;
+        }
+    }
+
+    private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr FindWindow(string lpClassName, string? lpWindowName);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr FindWindowEx(IntPtr parentHandle, IntPtr childAfter, string? lpszClass, string? lpszWindow);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam,
+        SendMessageTimeoutFlags fuFlags, uint uTimeout, out IntPtr lpdwResult);
+
+    [Flags]
+    private enum SendMessageTimeoutFlags : uint
+    {
+        SMTO_NORMAL = 0x0000,
+        SMTO_BLOCK = 0x0001,
+        SMTO_ABORTIFHUNG = 0x0002,
+        SMTO_NOTIMEOUTIFNOTHUNG = 0x0008
+    }
+}
+
+public class InputBox : Form
+{
+    private TextBox textBox;
+    private Button okButton;
+    private Button cancelButton;
+
+    public string InputText => textBox.Text;
+
+    public InputBox(string title, string prompt, string defaultText)
+    {
+        Text = title;
+        Size = new Size(400, 160);
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        Label label = new Label { Left = 10, Top = 10, Width = 360, Text = prompt };
+        textBox = new TextBox { Left = 10, Top = 35, Width = 360, Text = defaultText };
+        okButton = new Button { Text = "OK", Left = 210, Top = 80, Width = 75, DialogResult = DialogResult.OK };
+        cancelButton = new Button { Text = "Cancel", Left = 295, Top = 80, Width = 75, DialogResult = DialogResult.Cancel };
+
+        AcceptButton = okButton;
+        CancelButton = cancelButton;
+
+        Controls.Add(label);
+        Controls.Add(textBox);
+        Controls.Add(okButton);
+        Controls.Add(cancelButton);
+    }
+}
