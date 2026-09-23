@@ -1,27 +1,197 @@
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Windows.Forms;
 using Microsoft.Web.WebView2.WinForms;
 
 internal static class Program
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         ApplicationConfiguration.Initialize();
-        Application.Run(new WallpaperContext("http://127.0.0.1:5500"));
+
+        string url = "http://127.0.0.1:5500";
+        string? scriptPath = null;
+        string scriptContent = "";
+        int monitor = 0;
+        WallpaperContext.WallpaperMode mode = WallpaperContext.WallpaperMode.Span;
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "--url" when i + 1 < args.Length:
+                {
+                    url = args[++i].Trim();
+
+                    // Be forgiving: "excalidraw.com" -> "https://excalidraw.com"
+                    if (!url.Contains("://"))
+                        url = $"https://{url}";
+
+                    if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
+                        (uri.Scheme != Uri.UriSchemeHttp &&
+                         uri.Scheme != Uri.UriSchemeHttps))
+                    {
+                        MessageBox.Show(
+                            $"Invalid URL:\n\n{url}",
+                            "wv2wall - Error",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+
+                        return;
+                    }
+
+                    break;
+                }
+
+                case "--script" when i + 1 < args.Length:
+                {
+                    scriptPath = args[++i].Trim();
+
+                    // Expand relative paths against the current directory.
+                    scriptPath = Path.GetFullPath(scriptPath);
+
+                    if (!File.Exists(scriptPath))
+                    {
+                        MessageBox.Show(
+                            $"Script file not found:\n\n{scriptPath}",
+                            "wv2wall - Error",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+
+                        return;
+                    }
+
+                    scriptContent = File.ReadAllText(scriptPath); // Sync. because YOLO.
+                    break;
+                }
+
+                case "--script-content" when i + 1 < args.Length:
+                {
+                    scriptContent = args[++i];
+                    break;
+                }
+
+                case "--mode" when i + 1 < args.Length:
+                {
+                    string modeArg = args[++i].ToLowerInvariant();
+
+                    switch (modeArg)
+                    {
+                        case "single":
+                            mode = WallpaperContext.WallpaperMode.Single;
+                            break;
+
+                        case "all":
+                            mode = WallpaperContext.WallpaperMode.All;
+                            break;
+
+                        case "span":
+                            mode = WallpaperContext.WallpaperMode.Span;
+                            break;
+
+                        default:
+                            MessageBox.Show(
+                                $"Unknown wallpaper mode: {modeArg}\n\nExpected: single, all, or span.",
+                                "wv2wall - Error",
+                                MessageBoxButtons.OK,
+                                MessageBoxIcon.Error);
+
+                            return;
+                    }
+
+                    break;
+                }
+
+                case "--monitor" when i + 1 < args.Length:
+                {
+                    if (!int.TryParse(args[++i], out monitor) || monitor < 1)
+                    {
+                        MessageBox.Show(
+                            "Invalid monitor number.\n\nMonitor numbers start at 1.",
+                            "wv2wall - Error",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+
+                        return;
+                    }
+
+                    monitor--; // base 0
+
+                    break;
+                }
+
+                case "--help" or "-h":
+                {
+                    MessageBox.Show(
+                        """
+                        wv2wall - WebView2 desktop wallpaper
+
+                        Usage:
+                          wv2wall.exe [options]
+
+                        Options:
+
+                          --url <url>
+                              Wallpaper URL.
+                              Automatically adds https:// when no scheme is specified.
+                              Default: http://127.0.0.1:5500
+
+                          --script <path>
+                              Path to a JavaScript file to inject into the page.
+
+                          --script-content <js>
+                              JavaScript to inject directly from the command line.
+
+                          --mode <mode>
+                              Wallpaper mode:
+                                span      One wallpaper across all monitors (default)
+                                single    One monitor
+                                all       One wallpaper per monitor
+
+                          --monitor <number>
+                              Monitor to use in single mode, using 1-based numbering.
+                              Default: 1
+
+                          --help, -h
+                              Show this help message.
+
+                        Examples:
+
+                          wv2wall.exe
+                          wv2wall.exe --url https://excalidraw.com
+                          wv2wall.exe --url excalidraw.com --mode all
+                          wv2wall.exe --mode single --monitor 2
+                          wv2wall.exe --script sidebar.js
+                          wv2wall.exe --url excalidraw.com --script sidebar.js
+                        """,
+                        "wv2wall - Help",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+
+                    return;
+                }
+
+                default:
+                {
+                    MessageBox.Show(
+                        $"Unknown argument:\n\n{args[i]}",
+                        "wv2wall - Warning",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Warning);
+
+                    break;
+                }
+            }
+        }
+
+        Application.Run(new WallpaperContext(url, scriptContent, mode, monitor));
     }
 }
 
 internal sealed class WallpaperContext : ApplicationContext
 {
     private string _url;
+    private readonly string _scriptContent;
     private readonly NotifyIcon _tray;
     private readonly ContextMenuStrip _menu;
     private readonly List<ToolStripMenuItem> _monitorItems = new();
@@ -63,9 +233,11 @@ internal sealed class WallpaperContext : ApplicationContext
     private const int WM_CANCELMODE = 0x001F;
     private const int WM_CLOSE = 0x0010;
 
-    public WallpaperContext(string url)
+    public WallpaperContext(string url, string scriptContent, WallpaperMode mode, int monitor)
     {
         _url = url;
+        _scriptContent = scriptContent;
+
         _menu = new ContextMenuStrip();
         _tray = new NotifyIcon
         {
@@ -74,10 +246,14 @@ internal sealed class WallpaperContext : ApplicationContext
             Visible = true
         };
 
+        _mode = mode;
+        _selectedMonitor = monitor;
+
         BuildMenu();
         InstallHooks();
         ApplyMode();
     }
+
 
     private void InstallHooks()
     {
@@ -99,6 +275,7 @@ internal sealed class WallpaperContext : ApplicationContext
             UnhookWindowsHookEx(_mouseHook);
             _mouseHook = IntPtr.Zero;
         }
+
         if (_keyboardHook != IntPtr.Zero)
         {
             UnhookWindowsHookEx(_keyboardHook);
@@ -153,6 +330,7 @@ internal sealed class WallpaperContext : ApplicationContext
                 }
             }
         }
+
         return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
     }
 
@@ -188,7 +366,8 @@ internal sealed class WallpaperContext : ApplicationContext
     {
         uint pid;
         GetWindowThreadProcessId(hWndDesktop, out pid);
-        IntPtr hProcess = OpenProcess(ProcessAccessFlags.VirtualMemoryOperation | ProcessAccessFlags.VirtualMemoryRead | ProcessAccessFlags.VirtualMemoryWrite, false, (int)pid);
+        IntPtr hProcess = OpenProcess(ProcessAccessFlags.VirtualMemoryOperation | ProcessAccessFlags.VirtualMemoryRead | ProcessAccessFlags.VirtualMemoryWrite,
+            false, (int)pid);
         if (hProcess == IntPtr.Zero) return;
 
         IntPtr memPtr = IntPtr.Zero;
@@ -214,7 +393,9 @@ internal sealed class WallpaperContext : ApplicationContext
 
             SendMessage(hWndDesktop, LVM_SETITEMSTATE, (IntPtr)(-1), memPtr);
         }
-        catch { }
+        catch
+        {
+        }
         finally
         {
             if (memPtr != IntPtr.Zero) VirtualFreeEx(hProcess, memPtr, 0, FreeType.Release);
@@ -236,6 +417,7 @@ internal sealed class WallpaperContext : ApplicationContext
                 {
                     _isInteractingWithDesktop = false;
                 }
+
                 return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
             }
 
@@ -318,6 +500,7 @@ internal sealed class WallpaperContext : ApplicationContext
                 }
             }
         }
+
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
     }
 
@@ -334,7 +517,9 @@ internal sealed class WallpaperContext : ApplicationContext
 
     private bool IsDesktopWindow(IntPtr hwnd)
     {
-        foreach (var form in _forms) if (form.Handle == hwnd) return true;
+        foreach (var form in _forms)
+            if (form.Handle == hwnd)
+                return true;
 
         IntPtr root = GetAncestor(hwnd, GetAncestorFlags.GetRoot);
         if (root == IntPtr.Zero) root = hwnd;
@@ -355,7 +540,8 @@ internal sealed class WallpaperContext : ApplicationContext
         uint pid;
         GetWindowThreadProcessId(hWnd, out pid);
 
-        IntPtr hProcess = OpenProcess(ProcessAccessFlags.VirtualMemoryOperation | ProcessAccessFlags.VirtualMemoryRead | ProcessAccessFlags.VirtualMemoryWrite, false, (int)pid);
+        IntPtr hProcess = OpenProcess(ProcessAccessFlags.VirtualMemoryOperation | ProcessAccessFlags.VirtualMemoryRead | ProcessAccessFlags.VirtualMemoryWrite,
+            false, (int)pid);
         if (hProcess == IntPtr.Zero) return false;
 
         IntPtr memPtr = IntPtr.Zero;
@@ -395,7 +581,9 @@ internal sealed class WallpaperContext : ApplicationContext
                 return true;
             }
         }
-        catch { }
+        catch
+        {
+        }
         finally
         {
             if (memPtr != IntPtr.Zero) VirtualFreeEx(hProcess, memPtr, 0, FreeType.Release);
@@ -478,6 +666,7 @@ internal sealed class WallpaperContext : ApplicationContext
             {
                 form.Close();
             }
+
             return;
         }
 
@@ -508,7 +697,7 @@ internal sealed class WallpaperContext : ApplicationContext
 
     private DeskForm CreateForm(Rectangle targetBounds, Rectangle virtualBounds)
     {
-        var form = new DeskForm(_url, targetBounds, virtualBounds);
+        var form = new DeskForm(_url, _scriptContent, targetBounds, virtualBounds);
         form.FormClosed += OnFormClosed;
         form.Show();
         return form;
@@ -565,9 +754,15 @@ internal sealed class WallpaperContext : ApplicationContext
         }
     }
 
-    private enum WallpaperMode { Span, All, Single }
+    internal enum WallpaperMode
+    {
+        Span,
+        All,
+        Single
+    }
 
     private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
     private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -607,7 +802,12 @@ internal sealed class WallpaperContext : ApplicationContext
         public int iGroup;
     }
 
-    private enum GetAncestorFlags { GetParent = 1, GetRoot = 2, GetRootOwner = 3 }
+    private enum GetAncestorFlags
+    {
+        GetParent = 1,
+        GetRoot = 2,
+        GetRootOwner = 3
+    }
 
     [Flags]
     private enum ProcessAccessFlags : uint
@@ -713,6 +913,7 @@ public sealed class DeskForm : Form
     private static readonly IntPtr HWND_BOTTOM = new(1);
     private readonly WebView2 _wv = new();
     private readonly string _url;
+    private readonly string _scriptContent;
     private readonly Rectangle _targetBounds;
     private readonly Rectangle _virtualBounds;
     private readonly CancellationTokenSource _initCts = new();
@@ -720,9 +921,10 @@ public sealed class DeskForm : Form
     private bool _closing;
     private const int HR_RESOURCE_NOT_READY = unchecked((int)0x8007139F);
 
-    public DeskForm(string url, Rectangle targetBounds, Rectangle virtualBounds)
+    public DeskForm(string url, string scriptContent, Rectangle targetBounds, Rectangle virtualBounds)
     {
         _url = url;
+        _scriptContent = scriptContent;
         _targetBounds = targetBounds;
         _virtualBounds = virtualBounds;
 
@@ -762,7 +964,9 @@ public sealed class DeskForm : Form
             string json = $"{{\"type\":\"mouseWheel\",\"x\":{x},\"y\":{y},\"deltaX\":0,\"deltaY\":{val}}}";
             _wv.CoreWebView2.CallDevToolsProtocolMethodAsync("Input.dispatchMouseEvent", json);
         }
-        catch { }
+        catch
+        {
+        }
     }
 
     public void PostKey(int msg, int vkCode, int scanCode, int flags)
@@ -852,6 +1056,7 @@ public sealed class DeskForm : Form
             if (found != IntPtr.Zero) return found;
             child = FindWindowEx(parent, child, null, null);
         }
+
         return IntPtr.Zero;
     }
 
@@ -867,13 +1072,26 @@ public sealed class DeskForm : Form
 
                 _wv.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
                 _wv.CoreWebView2.Settings.AreDevToolsEnabled = false;
+
+                if (!string.IsNullOrWhiteSpace(_scriptContent))
+                {
+                    await _wv.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(_scriptContent);
+                }
+
                 _wv.CoreWebView2.Navigate(_url);
                 return;
             }
             catch (COMException ex) when (ex.ErrorCode == HR_RESOURCE_NOT_READY)
             {
                 attempt++;
-                try { await Task.Delay(200, _initCts.Token); } catch { return; }
+                try
+                {
+                    await Task.Delay(200, _initCts.Token);
+                }
+                catch
+                {
+                    return;
+                }
             }
             catch (Exception) when (_closing || _initCts.IsCancellationRequested || IsDisposed)
             {
@@ -941,6 +1159,7 @@ public sealed class DeskForm : Form
                     workerw = FindWindowEx(IntPtr.Zero, top, WorkerWClass, null);
                     return false;
                 }
+
                 return true;
             }, IntPtr.Zero);
 
